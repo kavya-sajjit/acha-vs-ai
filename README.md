@@ -4,7 +4,6 @@ Paper-trading experiment: give an LLM a fake ₹1,00,000 (or whatever amount you
 and a "great investor" persona prompt, let it trade NSE stocks on historical data,
 and compare how it does against your dad's actual trading rules.
 
-No real money is ever used. This only simulates trades against historical price data.
 
 ## Project structure
 
