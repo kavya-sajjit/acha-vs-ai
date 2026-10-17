@@ -4,7 +4,12 @@
 
 # generated data (regenerable, don't need to be in git)
 data/*.csv
+data/fundamentals/
 logs/*.csv
+
+# keep folder structure
+!data/.gitkeep
+!logs/.gitkeep
 
 # python
 __pycache__/
