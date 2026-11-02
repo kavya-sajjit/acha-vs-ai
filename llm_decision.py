@@ -13,6 +13,8 @@ import os
 import re
 import requests
 
+from llm_cache import cached_call
+
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 
 
@@ -206,8 +208,12 @@ def call_mock_engine(persona_name: str, ticker: str, fundamentals_data: dict, pr
     return {"action": "hold", "confidence": 0.5, "reasoning": "Holding position."}
 
 
-def call_gemini_api(prompt_text: str, api_key: str, model: str = "gemini-2.5-flash") -> str:
-    """Call Google Gemini REST API."""
+GEMINI_MODEL = "gemini-2.5-flash"
+OPENAI_MODEL = "gpt-4o-mini"
+
+
+def call_gemini_api(prompt_text: str, api_key: str, model: str = GEMINI_MODEL) -> tuple:
+    """Call Google Gemini REST API. Returns (text, usage)."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     payload = {
@@ -220,16 +226,17 @@ def call_gemini_api(prompt_text: str, api_key: str, model: str = "gemini-2.5-fla
     resp = requests.post(url, headers=headers, json=payload, timeout=25)
     resp.raise_for_status()
     data = resp.json()
+    usage = data.get("usageMetadata", {})
     candidates = data.get("candidates", [])
     if candidates:
         parts = candidates[0].get("content", {}).get("parts", [])
         if parts:
-            return parts[0].get("text", "")
-    return ""
+            return parts[0].get("text", ""), usage
+    return "", usage
 
 
-def call_openai_api(prompt_text: str, api_key: str, model: str = "gpt-4o-mini") -> str:
-    """Call OpenAI Chat Completions REST API."""
+def call_openai_api(prompt_text: str, api_key: str, model: str = OPENAI_MODEL) -> tuple:
+    """Call OpenAI Chat Completions REST API. Returns (text, usage)."""
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -247,10 +254,11 @@ def call_openai_api(prompt_text: str, api_key: str, model: str = "gpt-4o-mini") 
     resp = requests.post(url, headers=headers, json=payload, timeout=25)
     resp.raise_for_status()
     data = resp.json()
+    usage = data.get("usage", {})
     choices = data.get("choices", [])
     if choices:
-        return choices[0].get("message", {}).get("content", "")
-    return ""
+        return choices[0].get("message", {}).get("content", ""), usage
+    return "", usage
 
 
 def get_trading_decision(
@@ -294,10 +302,13 @@ Based strictly on your persona instructions above, evaluate {ticker} and respond
 """
 
     try:
+        meta = {"persona": persona_name, "ticker": ticker, "date": date_str}
         if provider == "gemini":
-            raw_output = call_gemini_api(user_prompt, api_key)
+            raw_output = cached_call("gemini", GEMINI_MODEL, user_prompt,
+                                     lambda: call_gemini_api(user_prompt, api_key), **meta)
         elif provider == "openai":
-            raw_output = call_openai_api(user_prompt, api_key)
+            raw_output = cached_call("openai", OPENAI_MODEL, user_prompt,
+                                     lambda: call_openai_api(user_prompt, api_key), **meta)
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
