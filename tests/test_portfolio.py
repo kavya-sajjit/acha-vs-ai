@@ -6,13 +6,19 @@ no AI. If this prints numbers that match what you'd expect by hand, the
 core bookkeeping is correct and safe to build the LLM layer on top of.
 
 Run:
-    python test_portfolio.py
+    pytest -q tests/
 """
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from portfolio import Portfolio
 
 
-def main():
+def test_portfolio_bookkeeping(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)   # save_log writes into logs/
+    (tmp_path / "logs").mkdir()
     p = Portfolio(starting_cash=1000, name="sanity_check")
 
     print("Starting cash: 1000")
@@ -49,4 +55,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import pytest
+    raise SystemExit(pytest.main([__file__, "-q"]))

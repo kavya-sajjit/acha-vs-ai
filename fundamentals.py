@@ -62,6 +62,41 @@ def get_series(df: pd.DataFrame, row_candidates: list) -> list:
     return []
 
 
+def get_dated_series(df: pd.DataFrame, row_candidates: list) -> list:
+    """Like get_series, but keeps each value's period-end date: [["YYYY-MM-DD", value], ...], oldest first.
+
+    The dates are what make point-in-time backtesting possible (see fundamentals_as_of).
+    """
+    if df is None or df.empty:
+        return []
+    for candidate in row_candidates:
+        if candidate in df.index:
+            try:
+                s = df.loc[candidate].dropna()
+                return [[str(d)[:10], float(v)] for d, v in s.iloc[::-1].items()]
+            except Exception:
+                continue
+    return []
+
+
+SCHEMA_VERSION = 2   # bump when the cached JSON layout changes, so old caches are refetched
+
+SERIES_ROWS = {
+    # key: (statement, row-name candidates)
+    "revenues": ("inc", ["Total Revenue", "Operating Revenue"]),
+    "operating_incomes": ("inc", ["Operating Income", "Gross Profit"]),
+    "net_incomes": ("inc", ["Net Income", "Net Income Common Stockholders"]),
+    "capex": ("cf", ["Capital Expenditure", "Capital Expenditure Reported"]),
+    "long_term_debt": ("bs", ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"]),
+    "current_debt": ("bs", ["Current Debt", "Current Debt And Capital Lease Obligation"]),
+    "working_capital": ("bs", ["Working Capital"]),
+    "stockholders_equity": ("bs", ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]),
+    "other_income": ("inc", ["Other Non Operating Income Expenses", "Special Income Charges", "Net Non Operating Interest Income Expense", "Interest Income Non Operating"]),
+    "investments": ("bs", ["Long Term Equity Investment", "Other Investments", "Investments And Advances"]),
+    "eps": ("inc", ["Diluted EPS", "Basic EPS"]),
+}
+
+
 def format_inr(val: float) -> str:
     """Format numbers into human-readable Indian Crores or standard format."""
     if val is None or pd.isna(val):
@@ -89,7 +124,9 @@ def fetch_fundamentals_data(ticker: str, refresh: bool = False) -> dict:
             mtime = os.path.getmtime(cache_path)
             if (datetime.now().timestamp() - mtime) < 3 * 86400:
                 with open(cache_path, "r") as f:
-                    return json.load(f)
+                    cached = json.load(f)
+                if cached.get("schema") == SCHEMA_VERSION:
+                    return cached
         except Exception:
             pass
 
@@ -163,6 +200,13 @@ def fetch_fundamentals_data(ticker: str, refresh: bool = False) -> dict:
             "investments": investments,
         },
         "dividends_history": div_records,
+        # Point-in-time inputs: every statement value with its period-end date, and every dividend with its date.
+        "financial_series_dated": {
+            key: get_dated_series({"inc": inc, "bs": bs, "cf": cf}[stmt], rows)
+            for key, (stmt, rows) in SERIES_ROWS.items()
+        },
+        "dividends_dated": [[str(d)[:10], float(v)] for d, v in divs.items()] if divs is not None and not divs.empty else [],
+        "schema": SCHEMA_VERSION,
         "updated_at": datetime.now().isoformat(),
     }
 
@@ -471,18 +515,71 @@ def analyze_dad_rules(fund_data: dict) -> dict:
     }
 
 
+REPORTING_LAG_DAYS = 60   # SEBI LODR: audited annual results are due within 60 days of year end
+
+
+def fundamentals_as_of(fund_data: dict, as_of, price: float = None, lag_days: int = REPORTING_LAG_DAYS) -> dict:
+    """Return the fundamentals an investor could actually have known on `as_of`.
+
+    A statement for the year ending on date D only counts once D + lag_days <= as_of.
+    P/E is recomputed from `price` (the price on as_of) and the last *reported* EPS, and the
+    dividend yield from dividends paid in the 12 months before as_of. Anything that only
+    describes today (market cap, forward P/E) is dropped.
+
+    Caches written before point-in-time support have no dated series; for those every
+    series comes back empty, so the rules report missing data rather than peeking ahead.
+    """
+    as_of = pd.Timestamp(as_of).normalize()
+    cutoff = as_of - pd.Timedelta(days=lag_days)
+    dated = fund_data.get("financial_series_dated", {})
+
+    known = {k: [v for d, v in series if pd.Timestamp(d) <= cutoff] for k, series in dated.items()}
+    known_dates = sorted({d for series in dated.values() for d, _ in series if pd.Timestamp(d) <= cutoff})
+
+    eps = known.pop("eps", [])
+    trailing_pe = price / eps[-1] if price and eps and eps[-1] > 0 else None
+
+    divs = [(pd.Timestamp(d), v) for d, v in fund_data.get("dividends_dated", []) if pd.Timestamp(d) <= as_of]
+    by_year = {}
+    for d, v in divs:
+        by_year[d.year] = by_year.get(d.year, 0.0) + v
+    last_12m = sum(v for d, v in divs if d > as_of - pd.Timedelta(days=365))
+
+    out = {k: v for k, v in fund_data.items() if k not in ("financial_series_dated", "dividends_dated")}
+    out.update({
+        "as_of": as_of.strftime("%Y-%m-%d"),
+        "current_price": price,
+        "market_cap": None,
+        "forward_pe": None,
+        "trailing_pe": trailing_pe,
+        "dividend_yield": (last_12m / price) if price else None,
+        "bs_years": known_dates,
+        "inc_years": known_dates,
+        "financial_series": {**{k: [] for k in fund_data.get("financial_series", {})},
+                             **{k: (list(map(abs, v)) if k == "capex" else v) for k, v in known.items()}},
+        "dividends_history": [{"year": y, "total_dividend": a} for y, a in sorted(by_year.items()) if y < as_of.year][-10:],
+    })
+    return out
+
+
 def build_fundamentals_context(ticker: str) -> str:
+    """Today's fundamentals for `ticker` as an LLM-ready block (for the CLI and dashboard, not backtests)."""
+    fund_data = fetch_fundamentals_data(ticker)
+    return format_fundamentals_context(fund_data, analyze_dad_rules(fund_data))
+
+
+def format_fundamentals_context(fund_data: dict, analysis: dict) -> str:
     """
     Format fundamental statements & Dad rule scorecard into an LLM-ready context block.
     """
-    fund_data = fetch_fundamentals_data(ticker)
-    analysis = analyze_dad_rules(fund_data)
+    ticker = fund_data.get("ticker", "")
     fs = fund_data.get("financial_series", {})
 
     dy = fund_data.get("dividend_yield") or 0.0
     dy_disp = dy if dy > 1.0 else dy * 100
     lines = [
         f"=== FUNDAMENTAL FINANCIAL STATEMENT CONTEXT FOR {ticker} ===",
+        *( [f"Only statements published by {fund_data['as_of']} are shown."] if fund_data.get("as_of") else [] ),
         f"Company Name: {fund_data.get('name', ticker)}",
         f"Sector / Industry: {fund_data.get('sector')} | {fund_data.get('industry')}",
         f"Market Cap: {format_inr(fund_data.get('market_cap'))}",

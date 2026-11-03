@@ -1,0 +1,19 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - name: Tests (must pass)
+        run: pytest -q tests/ --ignore=tests/test_metrics.py
+      # metrics.py is Kavya's exercise (TODO(kavya)). Until it's written these tests fail;
+      # that shows up as a warning on the run, not a red X. Delete continue-on-error once they pass.
+      - name: metrics.py exercise
+        continue-on-error: true
+        run: pytest -q tests/test_metrics.py

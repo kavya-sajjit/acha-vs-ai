@@ -49,7 +49,10 @@ dad-vs-ai-trader/
 ├── portfolio.py            # Bookkeeping portfolio tracker (cash, holdings, daily history)
 ├── fetch_data.py           # NSE historical daily price puller via yfinance
 ├── run_backtest.py         # CLI entry point with configurable arguments
-├── test_portfolio.py       # Deterministic sanity tests for portfolio math
+├── llm_cache.py            # Every LLM call cached to logs/llm_calls.jsonl (prompt, model, response, usage)
+├── metrics.py              # CAGR, Sharpe, Sortino, drawdown, turnover, hit rate, bootstrap CIs
+├── tests/                  # pytest: portfolio math, metrics, LLM cache
+├── RESEARCH_NOTES.md       # Look-ahead leaks found and the experiment plan
 ├── prompts/                # Persona system prompts
 │   ├── dad_hybrid.txt      # Dad's 14 exact investment rules
 │   ├── momentum_trader.txt # Trend following & RSI breakout strategy
@@ -82,7 +85,7 @@ pip install -r requirements.txt
 ### 2. Run Sanity Checks
 Verify the portfolio bookkeeping logic:
 ```bash
-python test_portfolio.py
+pytest -q tests/
 ```
 
 ### 3. Launch the Web Application
@@ -116,6 +119,12 @@ You can easily host this dashboard for free so anyone can use it online:
 4. Set Main file path: `app.py`.
 5. Click **"Deploy"**!
 6. *(Optional)* If using Gemini/OpenAI, add `GEMINI_API_KEY` under **App Settings → Secrets**.
+
+---
+
+## 🔬 Research question
+
+Can an LLM really out-trade Dad, or does it just remember what happened? See [`RESEARCH_NOTES.md`](RESEARCH_NOTES.md) for the three look-ahead leaks found in the backtest and the experiment that tests LLM memory.
 
 ---
 

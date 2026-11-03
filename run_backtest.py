@@ -30,6 +30,11 @@ def parse_args():
         choices=["3mo", "6mo", "1y", "2y", "3y", "5y"],
         help="Historical period to backtest over",
     )
+    parser.add_argument("--start", type=str, default=None,
+                        help="First date, YYYY-MM-DD. With --end, overrides --period and makes results reproducible")
+    parser.add_argument("--end", type=str, default=None, help="Last date (exclusive), YYYY-MM-DD")
+    parser.add_argument("--cost-bps", type=float, default=15.0,
+                        help="Trading cost per side in basis points (default 15 = 0.15%%)")
     parser.add_argument(
         "--cash",
         type=float,
@@ -74,7 +79,8 @@ def main():
     print("           ⚔️  DAD VS AI TRADER EXPERIMENT  ⚔️")
     print("=" * 65)
     print(f"Tickers:            {', '.join(tickers)}")
-    print(f"Period:             {args.period}")
+    print(f"Period:             {f'{args.start} to {args.end}' if args.start else args.period}")
+    print(f"Costs per side:     {args.cost_bps:g} bps (fills at next day's open)")
     print(f"Starting Cash:      ₹{args.cash:,.2f}")
     print(f"Personas:           {', '.join(personas)}")
     print(f"Dad's Frequency:    {args.dad_frequency}")
@@ -90,6 +96,9 @@ def main():
         eval_frequencies=freqs,
         llm_provider=args.provider,
         api_key=args.api_key,
+        start=args.start,
+        end=args.end,
+        cost_bps=args.cost_bps,
     )
 
     try:
@@ -110,6 +119,8 @@ def main():
     for persona in personas:
         print(f"  • logs/{persona}_trades.csv")
     print("  • logs/buy_and_hold_benchmark_trades.csv")
+    if args.provider != "mock":
+        print("  • logs/llm_calls.jsonl (every prompt and response, cached)")
     print("\nRun the interactive web dashboard with: streamlit run app.py\n")
 
 
