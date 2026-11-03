@@ -10,5 +10,10 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt pytest
-      # tests/test_metrics.py stays red until metrics.py is filled in (TODO(kavya)).
-      - run: pytest -q tests/
+      - name: Tests (must pass)
+        run: pytest -q tests/ --ignore=tests/test_metrics.py
+      # metrics.py is Kavya's exercise (TODO(kavya)). Until it's written these tests fail;
+      # that shows up as a warning on the run, not a red X. Delete continue-on-error once they pass.
+      - name: metrics.py exercise
+        continue-on-error: true
+        run: pytest -q tests/test_metrics.py

@@ -2,23 +2,21 @@
 
 A backtest is only meaningful if, on each simulated date, the strategy sees **only what was knowable on that date**. Reading the code, I found three places where the future leaks in. Fixing them, and measuring how much each one inflates returns, is the research contribution of this project.
 
-## Leak 1: fundamentals come from today (found in the code, needs fixing first)
+## Leak 1: fundamentals came from today (fixed)
 
 `fundamentals.fetch_fundamentals_data()` downloads the **current** balance sheet, income statement, cash flow and `info` (including today's P/E) from yfinance, once. `Backtester.prepare_data()` then uses that same snapshot for **every** simulated date.
 
 So on a simulated date in 2024, Dad's rules already see the 2025 annual report. Rules 4, 9, 10 and 13 (debt trend, 5-year doubling, reserves growth) are exactly the rules that benefit most from knowing the next report.
 
-**Fix (point-in-time fundamentals):**
-1. Keep each statement column with its period-end date.
-2. On simulated date `d`, use only statements whose period end + a reporting lag (≈60 days for annual results in India; SEBI LODR allows up to 60 days after year end) is ≤ `d`.
-3. Compute P/E from the price on `d` and the last *reported* EPS, not `info["trailingPE"]`.
-4. Write a test: a fake statement dated after `d` must never change the decision on `d`.
+**Fix (done, `fundamentals.fundamentals_as_of`):** each statement value is cached with its period-end date. On simulated date `d`, only statements with period end + 60 days ≤ `d` are visible (SEBI LODR gives listed companies up to 60 days after year end for audited annual results). P/E comes from the price on `d` and the last *reported* EPS; the dividend yield from dividends paid in the 12 months before `d`; market cap and forward P/E (today-only numbers) are dropped. `tests/test_no_lookahead.py` checks that a fake future report can't change a past decision.
+
+Run the backtest once after pulling this: old caches in `data/fundamentals/` have no dates, so they're refetched automatically.
 
 Note: yfinance only returns about the last 4 annual statements, so Rule 3 ("study 15–20 years") cannot be checked honestly with yfinance alone. Either state that limit in the README or switch to a source with longer history (company annual reports, Screener.in exports).
 
-## Leak 2: trading at the close that produced the signal
+## Leak 2: trading at the close that produced the signal (fixed)
 
-Decisions use day `t`'s close, and trades fill at that same close. In reality you see the close only after the market shuts. Fill at day `t+1`'s open (or close), and add brokerage + STT + slippage (≈0.1–0.2% per side for Indian equity delivery).
+Decisions used day `t`'s close and filled at that same close, but you only see the close after the market shuts. Now orders fill at day `t+1`'s open, with costs of 15 bps per side by default (`--cost-bps`; brokerage + STT + exchange charges + slippage for NSE delivery is roughly 0.1–0.2%). No decisions are made on the last day, since they could never fill. Tested in `tests/test_no_lookahead.py`.
 
 ## Leak 3: the LLM may remember the future (the headline experiment)
 
@@ -40,9 +38,11 @@ Requirements for this to be trustworthy:
 
 ## Order of work
 
-1. `metrics.py`: fill in the TODOs (tests in `tests/test_metrics.py`).
-2. Fixed `--start/--end` dates instead of `--period`, so results don't move every day.
-3. Leak 1 (point-in-time fundamentals) + its test.
-4. Leak 2 (next-day fills + costs).
-5. Nifty 50 benchmark + walk-forward windows.
+1. ~~Fixed `--start/--end` dates~~ (done; `make results` uses 2024-04-01 to 2026-04-01).
+2. ~~Leak 1~~ and ~~Leak 2~~ (done, with tests).
+3. ~~Nifty 50 benchmark~~ (done: `^NSEI` buy-and-hold in the leaderboard and chart).
+4. `metrics.py`: fill in the TODOs (tests in `tests/test_metrics.py`), then use them for the leaderboard instead of `Portfolio.get_metrics`, and add bootstrap CIs.
+5. Walk-forward windows: run the same strategies on several consecutive 1-year windows and report the spread.
 6. Leak 3 experiment, A vs B vs C, then a Results section with plots.
+
+A known limit to state in the write-up: yfinance returns only about the last 4 annual reports, so for a 2024 start date Dad's rules see 1–2 years of history. Rule 3 ("study 15–20 years") can't be tested honestly without a longer source (annual reports or Screener.in exports).

@@ -10,7 +10,7 @@ app:
 	streamlit run app.py
 
 # Regenerates the leaderboard and trade logs with the offline rule engine.
-# TODO(kavya): once the backtest takes fixed --start/--end dates instead of a
-# relative --period, pin them here so `make results` gives the same numbers every time.
+# Fixed dates, so the numbers are the same every time (prices are cached in data/).
+TICKERS = RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ITC.NS
 results:
-	python run_backtest.py --tickers RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ITC.NS --period 2y --dad-frequency quarterly
+	python run_backtest.py --tickers $(TICKERS) --start 2024-04-01 --end 2026-04-01 --dad-frequency quarterly

@@ -356,6 +356,7 @@ if results:
             "risk_averse": "#a855f7",          # Purple for Risk-Averse
             "news_sentiment": "#ec4899",       # Pink for Sentiment
             "Buy & Hold Benchmark": "#94a3b8", # Slate for Benchmark
+            "Nifty 50": "#e2e8f0",             # Light grey for the index
         }
 
         for col in equity_df.columns:
@@ -363,7 +364,7 @@ if results:
                 continue
             line_color = color_palette.get(col, "#ffffff")
             is_dad = col == "dad_hybrid"
-            is_bench = "Benchmark" in col
+            is_bench = "Benchmark" in col or col == "Nifty 50"
 
             fig.add_trace(
                 go.Scatter(

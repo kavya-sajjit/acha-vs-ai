@@ -9,7 +9,12 @@ Supports multi-frequency evaluation:
 - Risk-averse investor evaluates weekly
 
 Logs every trade with full LLM / rule reasoning and compares performance against
-an Equal-Weight Buy & Hold benchmark.
+an Equal-Weight Buy & Hold benchmark and Nifty 50 buy-and-hold.
+
+No look-ahead:
+- Fundamentals are point-in-time: on each date a persona only sees annual statements
+  published by then (period end + 60 days), and P/E from that day's price.
+- Decisions use day t's close and are filled at day t+1's open, with trading costs.
 """
 
 import os
@@ -17,8 +22,10 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+import yfinance as yf
+
 from fetch_data import fetch_and_save
-from fundamentals import analyze_dad_rules, build_fundamentals_context, fetch_fundamentals_data
+from fundamentals import analyze_dad_rules, fetch_fundamentals_data, format_fundamentals_context, fundamentals_as_of
 from llm_decision import get_trading_decision
 from portfolio import Portfolio
 from price_context import build_price_context
@@ -43,14 +50,37 @@ FREQUENCY_DAYS = {
 }
 
 
-def load_ticker_history(ticker: str, period: str = "1y") -> pd.DataFrame:
-    """Load historical price DataFrame from CSV, or fetch if missing."""
-    clean_name = ticker.replace(".", "_")
-    csv_path = os.path.join(DATA_DIR, f"{clean_name}.csv")
+NIFTY50 = "^NSEI"
+DEFAULT_COST_BPS = 15.0   # per side: brokerage + STT + exchange charges + slippage, roughly, for NSE delivery
+
+
+def load_ticker_history(ticker: str, period: str = "1y", start: str = None, end: str = None) -> pd.DataFrame:
+    """Load historical prices from a CSV cache, or fetch them.
+
+    With start/end, the cache file is named after the date range, so a different range
+    never silently reuses old data, and the same range always gives the same numbers.
+    With only a relative period, the cache is refreshed daily ("1y" means something new every day).
+    """
+    clean_name = ticker.replace(".", "_").replace("^", "")
+    if start or end:
+        csv_path = os.path.join(DATA_DIR, f"{clean_name}_{start or 'begin'}_{end or 'today'}.csv")
+    else:
+        csv_path = os.path.join(DATA_DIR, f"{clean_name}_{period}_{datetime.now():%Y-%m-%d}.csv")
 
     if not os.path.exists(csv_path):
-        print(f"Fetching historical data for {ticker} ({period})...")
-        df = fetch_and_save(ticker, period=period)
+        print(f"Fetching historical data for {ticker} ({start or period} to {end or 'today'})...")
+        if start or end:
+            df = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False)
+            if not df.empty:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                df.to_csv(csv_path)
+        else:
+            df = fetch_and_save(ticker, period=period)
+            if not df.empty:
+                df.to_csv(csv_path)
+        df = df.reset_index()
+        if df.empty:
+            return pd.DataFrame()
     else:
         df = pd.read_csv(csv_path)
 
@@ -78,9 +108,14 @@ class Backtester:
         max_position_pct: float = 0.35,
         llm_provider: str = "mock",
         api_key: str = None,
+        start: str = None,
+        end: str = None,
+        cost_bps: float = DEFAULT_COST_BPS,
     ):
         self.tickers = tickers or ["RELIANCE.NS", "TCS.NS", "INFY.NS"]
         self.period = period
+        self.start, self.end = start, end
+        self.cost = cost_bps / 10_000
         self.initial_cash = initial_cash
         self.personas = personas or ["dad_hybrid", "momentum_trader", "value_investor", "risk_averse"]
         self.eval_frequencies = {**DEFAULT_FREQUENCIES, **(eval_frequencies or {})}
@@ -92,176 +127,194 @@ class Backtester:
         self.fundamentals_data = {}
         self.fundamentals_text = {}
         self.dad_analysis = {}
+        self.nifty = None
         self.common_dates = []
 
     def prepare_data(self):
         """Fetch and align all historical prices and fundamentals."""
-        print(f"Loading market data for {len(self.tickers)} tickers over {self.period}...")
+        span = f"{self.start} to {self.end or 'today'}" if self.start else self.period
+        print(f"Loading market data for {len(self.tickers)} tickers ({span})...")
         for ticker in self.tickers:
-            df = load_ticker_history(ticker, period=self.period)
+            df = load_ticker_history(ticker, period=self.period, start=self.start, end=self.end)
             if not df.empty:
                 self.price_data[ticker] = df
 
-            # Fundamentals
+            # Fundamentals are downloaded once (with dates), then cut to what was known on each
+            # simulated day in _fundamentals_on(). Never use the raw snapshot in decisions.
             try:
-                fund = fetch_fundamentals_data(ticker)
-                self.fundamentals_data[ticker] = fund
-                self.dad_analysis[ticker] = analyze_dad_rules(fund)
-                self.fundamentals_text[ticker] = build_fundamentals_context(ticker)
+                self.fundamentals_data[ticker] = fetch_fundamentals_data(ticker)
             except Exception as e:
                 print(f"  Warning: could not fetch fundamentals for {ticker}: {e}")
                 self.fundamentals_data[ticker] = {}
-                self.dad_analysis[ticker] = {}
-                self.fundamentals_text[ticker] = ""
 
         if not self.price_data:
             raise ValueError("No price data available for any ticker.")
 
-        # Find overlapping dates across all tickers
+        # Trade only on days every ticker has a price (sorted union as a fallback).
         date_sets = [set(df.index) for df in self.price_data.values()]
-        common = sorted(list(set.intersection(*date_sets)))
-        if not common:
-            # Fallback to sorted union if dates differ slightly
-            all_dates = sorted(list(set.union(*date_sets)))
-            self.common_dates = all_dates
-        else:
-            self.common_dates = common
+        common = sorted(set.intersection(*date_sets))
+        self.common_dates = common or sorted(set.union(*date_sets))
 
-        print(f"Data aligned. Found {len(self.common_dates)} trading days from {self.common_dates[0].strftime('%Y-%m-%d')} to {self.common_dates[-1].strftime('%Y-%m-%d')}.")
+        try:
+            nifty = load_ticker_history(NIFTY50, period=self.period, start=self.start, end=self.end)
+            if not nifty.empty:
+                self.nifty = nifty["Close"].reindex(self.common_dates).ffill().bfill()
+        except Exception as e:
+            print(f"  Warning: no Nifty 50 benchmark ({e})")
+
+        print(f"Data aligned. Found {len(self.common_dates)} trading days from {self.common_dates[0]:%Y-%m-%d} to {self.common_dates[-1]:%Y-%m-%d}.")
+
+    def _fundamentals_on(self, ticker, date, price):
+        """(point-in-time fundamentals, Dad-rule analysis, LLM context text) for `ticker` on `date`."""
+        raw = self.fundamentals_data.get(ticker) or {}
+        if not raw:
+            return {}, {}, ""
+        pit = fundamentals_as_of(raw, date, price=price)
+        analysis = analyze_dad_rules(pit)
+        return pit, analysis, format_fundamentals_context(pit, analysis)
+
+    def _price(self, ticker, dt, field="Close"):
+        df = self.price_data.get(ticker)
+        if df is None or dt not in df.index:
+            return None
+        col = field if field in df.columns and pd.notna(df.loc[dt, field]) else "Close"
+        v = float(df.loc[dt, col])
+        return v if v > 0 else None
+
+    def _execute(self, p, order, fill_date, open_prices):
+        """Fill an order decided on the previous day at today's open, including costs."""
+        ticker, action, conf, reason = order["ticker"], order["action"], order["confidence"], order["reasoning"]
+        px = open_prices.get(ticker)
+        if not px:
+            return
+        note = f"[decided {order['decided_on']}, filled at next open] {reason}"
+        if action == "buy":
+            fill = px * (1 + self.cost)
+            total_val = p.get_value(open_prices)
+            target_alloc = total_val * self.max_position_pct
+            alloc_room = max(0.0, target_alloc - p.holdings.get(ticker, 0) * px)
+            spendable = min(p.cash, alloc_room if alloc_room > 0 else p.cash * 0.4)
+            shares = int(spendable // fill)
+            if shares > 0:
+                p.buy(ticker, shares, fill, trade_date=fill_date, confidence=conf, reasoning=note)
+            else:
+                p.hold(ticker, trade_date=fill_date, confidence=conf, reasoning=f"Cash or allocation cap reached. {note}")
+        elif action == "sell":
+            held = p.holdings.get(ticker, 0)
+            if held > 0:
+                p.sell(ticker, held, px * (1 - self.cost), trade_date=fill_date, confidence=conf, reasoning=note)
+            else:
+                p.hold(ticker, trade_date=fill_date, confidence=conf, reasoning=f"No active position to sell. {note}")
 
     def run(self, progress_callback=None) -> dict:
         """Execute simulation across all personas and benchmarks."""
         if not self.common_dates:
             self.prepare_data()
 
-        # Initialize portfolios
         portfolios = {p: Portfolio(starting_cash=self.initial_cash, name=p) for p in self.personas}
+        pending = {p: [] for p in self.personas}       # orders decided today, filled tomorrow
 
-        # Equal-Weight Buy & Hold benchmark
+        # Equal-weight buy & hold of the chosen stocks, bought at the first day's close (no costs: it's the yardstick).
         benchmark = Portfolio(starting_cash=self.initial_cash, name="buy_and_hold_benchmark")
-
-        # Set up benchmark on Day 0: divide initial cash equally among all tickers
-        day_0_date = self.common_dates[0].strftime("%Y-%m-%d")
+        d0 = self.common_dates[0]
         per_ticker_cash = self.initial_cash / len(self.tickers)
         for ticker in self.tickers:
-            if ticker in self.price_data and self.common_dates[0] in self.price_data[ticker].index:
-                p0 = float(self.price_data[ticker].loc[self.common_dates[0], "Close"])
-                shares0 = int(per_ticker_cash // p0)
-                if shares0 > 0:
-                    benchmark.buy(ticker, shares0, p0, trade_date=day_0_date, reasoning="Initial Buy & Hold allocation.")
+            p0 = self._price(ticker, d0)
+            if p0 and int(per_ticker_cash // p0) > 0:
+                benchmark.buy(ticker, int(per_ticker_cash // p0), p0, trade_date=f"{d0:%Y-%m-%d}", reasoning="Initial Buy & Hold allocation.")
 
-        # Tracking step count per persona to control evaluation frequencies
+        # Nifty 50 buy & hold (fractional units of the index, so it tracks the index exactly).
+        nifty_pf = None
+        if self.nifty is not None:
+            nifty_pf = Portfolio(starting_cash=self.initial_cash, name="nifty50_buy_and_hold")
+            nifty_pf.buy(NIFTY50, self.initial_cash / float(self.nifty.iloc[0]), float(self.nifty.iloc[0]), trade_date=f"{d0:%Y-%m-%d}", reasoning="Nifty 50 buy & hold.")
+
         step_counters = {p: 0 for p in self.personas}
         total_days = len(self.common_dates)
 
         for idx, current_dt in enumerate(self.common_dates):
             date_str = current_dt.strftime("%Y-%m-%d")
-
-            # Collect current closing prices for this day
-            current_prices = {}
-            for ticker in self.tickers:
-                if ticker in self.price_data and current_dt in self.price_data[ticker].index:
-                    current_prices[ticker] = float(self.price_data[ticker].loc[current_dt, "Close"])
-
-            if not current_prices:
+            close = {t: px for t in self.tickers if (px := self._price(t, current_dt))}
+            opens = {t: px for t in self.tickers if (px := self._price(t, current_dt, "Open"))}
+            if not close:
                 continue
 
-            # Benchmark daily valuation
-            benchmark.record_daily(date_str, current_prices)
-
-            # Evaluate each persona
+            # 1. Yesterday's decisions fill at today's open.
             for persona in self.personas:
-                p = portfolios[persona]
-                freq = self.eval_frequencies.get(persona, "daily")
-                interval = FREQUENCY_DAYS.get(freq, 1)
+                for order in pending[persona]:
+                    self._execute(portfolios[persona], order, date_str, opens)
+                pending[persona] = []
 
-                is_eval_day = (step_counters[persona] % interval == 0) or (idx == 0)
+            benchmark.record_daily(date_str, close)
+            if nifty_pf is not None:
+                nifty_pf.record_daily(date_str, {NIFTY50: float(self.nifty.loc[current_dt])})
+
+            # 2. Today's decisions, from information available at today's close.
+            is_last_day = idx == total_days - 1
+            for persona in self.personas:
+                interval = FREQUENCY_DAYS.get(self.eval_frequencies.get(persona, "daily"), 1)
+                is_eval_day = (step_counters[persona] % interval == 0) and not is_last_day
                 step_counters[persona] += 1
 
                 if is_eval_day:
-                    for ticker in self.tickers:
-                        price = current_prices.get(ticker)
-                        if not price or price <= 0:
-                            continue
-
-                        # Build price context up to today
-                        df_sub = self.price_data[ticker]
-                        price_ctx = build_price_context(ticker, date_str, df_sub)
-
-                        # Decision
+                    for ticker, price in close.items():
+                        price_ctx = build_price_context(ticker, date_str, self.price_data[ticker])
+                        fund, analysis, fund_text = self._fundamentals_on(ticker, current_dt, price)
                         decision = get_trading_decision(
                             persona_name=persona,
                             ticker=ticker,
                             date_str=date_str,
                             price_ctx=price_ctx,
-                            fundamentals_ctx_text=self.fundamentals_text.get(ticker, ""),
-                            fundamentals_data=self.fundamentals_data.get(ticker, {}),
-                            dad_analysis=self.dad_analysis.get(ticker),
+                            fundamentals_ctx_text=fund_text,
+                            fundamentals_data=fund,
+                            dad_analysis=analysis,
                             provider=self.llm_provider,
                             api_key=self.api_key,
                         )
-
                         action = decision.get("action", "hold")
-                        conf = decision.get("confidence", 0.5)
-                        reason = decision.get("reasoning", "")
+                        if action in ("buy", "sell"):
+                            pending[persona].append({
+                                "ticker": ticker, "action": action, "decided_on": date_str,
+                                "confidence": decision.get("confidence", 0.5),
+                                "reasoning": decision.get("reasoning", ""),
+                            })
+                        else:
+                            portfolios[persona].hold(ticker, trade_date=date_str,
+                                                     confidence=decision.get("confidence", 0.5),
+                                                     reasoning=decision.get("reasoning", ""))
 
-                        if action == "buy":
-                            # Position sizing: up to max_position_pct of total portfolio value
-                            total_val = p.get_value(current_prices)
-                            target_alloc = total_val * self.max_position_pct
-                            current_held_val = p.holdings.get(ticker, 0) * price
-                            alloc_room = max(0.0, target_alloc - current_held_val)
-                            spendable_cash = min(p.cash, alloc_room if alloc_room > 0 else p.cash * 0.4)
+                portfolios[persona].record_daily(date_str, close)
 
-                            shares_to_buy = int(spendable_cash // price)
-                            if shares_to_buy > 0:
-                                p.buy(ticker, shares_to_buy, price, trade_date=date_str, confidence=conf, reasoning=reason)
-                            else:
-                                p.hold(ticker, trade_date=date_str, confidence=conf, reasoning=f"Cash or allocation cap reached. {reason}")
-
-                        elif action == "sell":
-                            held_shares = p.holdings.get(ticker, 0)
-                            if held_shares > 0:
-                                p.sell(ticker, held_shares, price, trade_date=date_str, confidence=conf, reasoning=reason)
-                            else:
-                                p.hold(ticker, trade_date=date_str, confidence=conf, reasoning=f"No active position to sell. {reason}")
-
-                        else:  # hold
-                            p.hold(ticker, trade_date=date_str, confidence=conf, reasoning=reason)
-
-                # Record daily total valuation
-                p.record_daily(date_str, current_prices)
-
-            if progress_callback and (idx % 10 == 0 or idx == total_days - 1):
+            if progress_callback and (idx % 10 == 0 or is_last_day):
                 progress_callback(idx + 1, total_days)
 
-        # Assemble summary metrics
+        # Dad's scorecard as of the last day, for the dashboard.
+        last = self.common_dates[-1]
+        for ticker in self.tickers:
+            _, self.dad_analysis[ticker], _ = self._fundamentals_on(ticker, last, self._price(ticker, last))
+
         metrics_rows = []
         for persona in self.personas:
-            p = portfolios[persona]
-            m = p.get_metrics()
+            m = portfolios[persona].get_metrics()
             m["persona"] = persona
             m["frequency"] = self.eval_frequencies.get(persona, "daily")
             metrics_rows.append(m)
+        for pf, label in [(benchmark, "Buy & Hold (Benchmark)"), (nifty_pf, "Nifty 50 Buy & Hold")]:
+            if pf is not None:
+                m = pf.get_metrics()
+                m["persona"], m["frequency"] = label, "passive"
+                metrics_rows.append(m)
 
-        b_metrics = benchmark.get_metrics()
-        b_metrics["persona"] = "Buy & Hold (Benchmark)"
-        b_metrics["frequency"] = "passive"
-        metrics_rows.append(b_metrics)
+        metrics_df = pd.DataFrame(metrics_rows).sort_values("total_return_pct", ascending=False).reset_index(drop=True)
 
-        metrics_df = pd.DataFrame(metrics_rows)
-        metrics_df = metrics_df.sort_values("total_return_pct", ascending=False).reset_index(drop=True)
-
-        # Assemble daily equity curves DataFrame
         equity_dict = {"date": [d.strftime("%Y-%m-%d") for d in self.common_dates]}
         for persona in self.personas:
-            p = portfolios[persona]
-            equity_dict[persona] = [h["total_value"] for h in p.daily_history]
+            equity_dict[persona] = [h["total_value"] for h in portfolios[persona].daily_history]
         equity_dict["Buy & Hold Benchmark"] = [h["total_value"] for h in benchmark.daily_history]
-
+        if nifty_pf is not None:
+            equity_dict["Nifty 50"] = [h["total_value"] for h in nifty_pf.daily_history]
         equity_df = pd.DataFrame(equity_dict)
 
-        # Save all trade logs to logs/
         for p in portfolios.values():
             p.save_log()
         benchmark.save_log()
@@ -271,6 +324,7 @@ class Backtester:
             "equity_df": equity_df,
             "portfolios": portfolios,
             "benchmark": benchmark,
+            "nifty": nifty_pf,
             "dad_analysis": self.dad_analysis,
             "tickers": self.tickers,
             "common_dates": [d.strftime("%Y-%m-%d") for d in self.common_dates],
